@@ -14,9 +14,11 @@ module Fluent
     config_param :database, :string
     config_param :username, :string
     config_param :password, :string, :default => '', :secret => true
-
-    config_param :key_names, :string, :default => nil
-    config_param :sql, :string, :default => nil
+    
+    config_section :sql, param_name: :sql_statements, required: true, multi: true do
+      config_param :key_names, :string
+      config_param :mysql, :string
+    end
 
     attr_accessor :handler
 
@@ -28,24 +30,26 @@ module Fluent
     def configure(conf)
       super
 
-      if @sql.nil?
-        raise Fluent::ConfigError, "sql MUST be specified, but missing"
+      if @sql_statements.empty?
+        raise Fluent::ConfigError, "<sql> MUST be specified, but missing"
+      end
+      
+      @sqls = @sql_statements.map do |entry|
+        {
+          mysql: entry.mysql,
+          key_names: entry.key_names.split(',')
+        }
       end
 
-      if @key_names.nil?
-        raise Fluent::ConfigError, "key_names MUST be specified, but missing"
+      @sqls.each do |entry|
+        begin
+          Mysql2::Client.pseudo_bind(entry[:mysql], entry[:key_names].map{ nil })
+        rescue ArgumentError => e
+          raise Fluent::ConfigError, "mismatch between sql placeholders and key_names in query: #{entry[:mysql]}"
+        end
       end
 
-      @key_names = @key_names.split(',')
-      @format_proc = Proc.new{|tag, time, record| @key_names.map{|k| record[k]}}
-
-      begin
-        Mysql2::Client.pseudo_bind(@sql, @key_names.map{|n| nil})
-      rescue ArgumentError => e
-        raise Fluent::ConfigError, "mismatch between sql placeholders and key_names"
-      end
-
-      $log.info "sql ->[#{@sql}]"
+      $log.info "Loaded SQL statements: #{@sqls.map { |s| s[:mysql] }}"
     end
 
     def start
@@ -57,7 +61,7 @@ module Fluent
     end
 
     def format(tag, time, record)
-      [tag, time, @format_proc.call(tag, time, record)].to_msgpack
+      [tag, time, record].to_msgpack
     end
 
     def client
@@ -73,24 +77,28 @@ module Fluent
 
     def write(chunk)
       @handler = client
-      $log.info "adding mysql_query job: "
-      chunk.msgpack_each { |tag, time, data|
+      $log.info "Executing MySQL queries..."
+      chunk.msgpack_each do |tag, time, data|
         results = get_exec_result(data)
-        results.each{|result|
-          router.emit(@output_tag, Fluent::Engine.now, result)
-        }
-      }
+        results.each { |result| router.emit(@output_tag, Fluent::Engine.now, result) }
+      end
       @handler.close
     end
 
     def get_exec_result(data)
-      results = Array.new
-      stmt = @handler.xquery(@sql, data)
-      return results if stmt.nil?
-      stmt.each do |row|
-        results.push(row)
+      results = []
+      @sqls.each do |entry|
+        sql = entry[:mysql]
+        $log.info "executing #{sql}"
+        key_names = entry[:key_names]
+        values = key_names.map { |k| data[k] }
+
+        stmt = @handler.xquery(sql, values)
+        next if stmt.nil?
+        stmt.each { |row| results.push(row) }
       end
-      return results
+      results
     end
   end
 end
+
